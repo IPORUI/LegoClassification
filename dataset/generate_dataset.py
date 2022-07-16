@@ -22,10 +22,12 @@ OUT_CSV = ROOT + r"data\RenderedParts_2.csv"
 
 
 class CamSettings:
-    def __init__(self, pos_y, height, rot, horizontal_fov, sensor_height, sensor_width):
+    def __init__(self, pos_y, height, rot, horizontal_fov, sensor_height, sensor_width, height_range=0., rot_range=0.):
         self.sensor_width = sensor_width
         self.sensor_height = sensor_height
         self.horizontal_fov = horizontal_fov
+        self.cam_height_range = height_range
+        self.cam_angle_range = rot_range
         self.rot = rot
         self.pos_y = pos_y
         self.height = height
@@ -34,8 +36,8 @@ class CamSettings:
         cam = self.cam()
         cam.location.x = 0
         cam.location.y = self.pos_y
-        cam.location.z = self.height
-        cam.rotation_euler[0] = math.radians(self.rot)
+        cam.location.z = self.height + random.uniform(-self.cam_height_range, self.cam_height_range)
+        cam.rotation_euler[0] = math.radians(self.rot + random.uniform(-self.cam_angle_range, self.cam_angle_range))
         cam.rotation_euler[1] = 0
         cam.rotation_euler[2] = 0
         cam.data.sensor_fit = 'VERTICAL'
@@ -54,9 +56,11 @@ class RaspiCamV1(CamSettings):
 
 
 class RenderSettings:
-    def __init__(self, device='GPU', crop_mode='part', random_crop_pad_std=0.001, samples=64, max_bounces=4, diffuse_bounces=3, glossy_bounces=3,
+    def __init__(self, device='GPU', crop_mode='part', random_crop_pad_std=0.001, samples=64, max_bounces=4,
+                 diffuse_bounces=3, glossy_bounces=3,
                  transmission_bounces=3,
-                 transparent_max_bounces=3, use_persistent_data=True, resolution_x=720, resolution_y=720, tile_size=720):
+                 transparent_max_bounces=3, use_persistent_data=True, resolution_x=720, resolution_y=720,
+                 tile_size=720):
         crop_modes = ['all', 'boundbox', 'part']
         if crop_mode not in crop_modes:
             raise ValueError(f"Invalid crop mode, allowed: {crop_modes}")
@@ -92,7 +96,79 @@ class RenderSettings:
         ratio = float(self.resolution_x) / self.resolution_y
         return ratio * (max_x - min_x) / (max_y - min_y)
 
-    def apply(self):
+    def apply_crop(self, part):
+        bpy.data.scenes[0].render.use_border = True
+        bpy.data.scenes[0].render.use_crop_to_border = True
+
+        scene = bpy.context.scene
+        cam = bpy.data.objects["Camera"]
+        bpy.context.view_layer.update()
+
+        min_x = 2.0
+        min_y = 2.0
+        max_x = -2.0
+        max_y = -2.0
+
+        # convert the part model bounding box coords to camera view coords, get min & max
+        if self.crop_mode == 'boundbox':
+            for pt in part.bound_box:
+                real_pos = part.matrix_world @ mathutils.Vector(pt)
+                scr_pos = bpy_extras.object_utils.world_to_camera_view(scene, cam, real_pos)
+                if scr_pos[0] < min_x:
+                    min_x = scr_pos[0]
+                elif scr_pos[0] > max_x:
+                    max_x = scr_pos[0]
+                if scr_pos[1] < min_y:
+                    min_y = scr_pos[1]
+                elif scr_pos[1] > max_y:
+                    max_y = scr_pos[1]
+        elif self.crop_mode == 'part':
+            for v in part.data.vertices:
+                real_pos = part.matrix_world @ mathutils.Vector(v.co)
+                scr_pos = bpy_extras.object_utils.world_to_camera_view(scene, cam, real_pos)
+                if scr_pos[0] < min_x:
+                    min_x = scr_pos[0]
+                elif scr_pos[0] > max_x:
+                    max_x = scr_pos[0]
+                if scr_pos[1] < min_y:
+                    min_y = scr_pos[1]
+                elif scr_pos[1] > max_y:
+                    max_y = scr_pos[1]
+
+        # make the crop square todo: fix the float rounding errors and make the crop truly square
+        ratio = float(self.resolution_x) / self.resolution_y
+        quot = ratio * (max_x - min_x) / (max_y - min_y)
+        if quot > 1:
+            diff = ratio * (max_x - min_x) - (max_y - min_y)
+            max_y += diff / 2
+            min_y -= diff / 2
+        elif quot < 1:
+            diff = -(max_x - min_x) + (max_y - min_y) / ratio
+            max_x += diff / 2
+            min_x -= diff / 2
+
+        rand_tl = abs(np.random.normal(loc=0, scale=self.random_crop_pad_std))
+        rand_tr = abs(np.random.normal(loc=0, scale=self.random_crop_pad_std))
+        rand_br = abs(np.random.normal(loc=0, scale=self.random_crop_pad_std))
+        rand_bl = abs(np.random.normal(loc=0, scale=self.random_crop_pad_std))
+
+        if min_x - (rand_tl + rand_bl) < 0:
+            rand_tl = rand_bl = 0
+        if min_y - (rand_br + rand_bl) * ratio < 0:
+            rand_br = rand_bl = 0
+        if max_x + (rand_tr + rand_br) > 1:
+            rand_tr = rand_br = 0
+        if max_y + (rand_tl + rand_tr) * ratio > 1:
+            rand_tl = rand_tr = 0
+
+        bpy.context.scene.render.border_min_x = min_x - (rand_tl + rand_bl)
+        bpy.context.scene.render.border_min_y = min_y - (rand_br + rand_bl) * ratio
+        bpy.context.scene.render.border_max_x = max_x + (rand_tr + rand_br)
+        bpy.context.scene.render.border_max_y = max_y + (rand_tl + rand_tr) * ratio
+
+        return self.get_crop_quot()
+
+    def apply(self, part=None):
         bpy.data.scenes[0].cycles.device = self.device
         bpy.data.scenes[0].cycles.samples = self.samples
         bpy.data.scenes[0].cycles.max_bounces = self.max_bounces
@@ -105,92 +181,26 @@ class RenderSettings:
         bpy.data.scenes[0].render.resolution_y = self.resolution_y
         bpy.data.scenes[0].cycles.tile_size = self.tile_size
 
-        if not self.crop_mode == 'all':
-            bpy.data.scenes[0].render.use_border = True
-            bpy.data.scenes[0].render.use_crop_to_border = True
-
-            # get the lego part object
-            part = None
-            for i in bpy.data.objects.keys():
-                if '.dat' in i:
-                    part = bpy.data.objects[i]
-                    break
-
+        if self.crop_mode == 'all':
+            bpy.context.scene.render.border_min_x = 0
+            bpy.context.scene.render.border_min_y = 0
+            bpy.context.scene.render.border_max_x = 1
+            bpy.context.scene.render.border_max_y = 1
+        else:
             if part is None:
+                bpy.context.scene.render.border_min_x = 0
+                bpy.context.scene.render.border_min_y = 0
+                bpy.context.scene.render.border_max_x = 1
+                bpy.context.scene.render.border_max_y = 1
                 return False
-
-            scene = bpy.context.scene
-            cam = bpy.data.objects["Camera"]
-            bpy.context.view_layer.update()
-
-            # convert the part model bounding box coords to camera view coords
-            min_x = 2.0
-            min_y = 2.0
-            max_x = -2.0
-            max_y = -2.0
-
-            if self.crop_mode == 'boundbox':
-                for pt in part.bound_box:
-                    real_pos = part.matrix_world @ mathutils.Vector(pt)
-                    scr_pos = bpy_extras.object_utils.world_to_camera_view(scene, cam, real_pos)
-                    if scr_pos[0] < min_x:
-                        min_x = scr_pos[0]
-                    elif scr_pos[0] > max_x:
-                        max_x = scr_pos[0]
-                    if scr_pos[1] < min_y:
-                        min_y = scr_pos[1]
-                    elif scr_pos[1] > max_y:
-                        max_y = scr_pos[1]
-
-            elif self.crop_mode == 'part':
-                for v in part.data.vertices:
-                    real_pos = part.matrix_world @ mathutils.Vector(v.co)
-                    scr_pos = bpy_extras.object_utils.world_to_camera_view(scene, cam, real_pos)
-                    if scr_pos[0] < min_x:
-                        min_x = scr_pos[0]
-                    elif scr_pos[0] > max_x:
-                        max_x = scr_pos[0]
-                    if scr_pos[1] < min_y:
-                        min_y = scr_pos[1]
-                    elif scr_pos[1] > max_y:
-                        max_y = scr_pos[1]
-
-            # make the crop square todo: fix the float rounding errors and make the crop truly square
-            ratio = float(self.resolution_x) / self.resolution_y
-            quot = ratio * (max_x - min_x) / (max_y - min_y)
-            if quot > 1:
-                diff = ratio * (max_x - min_x) - (max_y - min_y)
-                max_y += diff / 2
-                min_y -= diff / 2
-            elif quot < 1:
-                diff = -(max_x - min_x) + (max_y - min_y) / ratio
-                max_x += diff / 2
-                min_x -= diff / 2
-
-            rand_tl = abs(np.random.normal(loc=0, scale=self.random_crop_pad_std))
-            rand_tr = abs(np.random.normal(loc=0, scale=self.random_crop_pad_std))
-            rand_br = abs(np.random.normal(loc=0, scale=self.random_crop_pad_std))
-            rand_bl = abs(np.random.normal(loc=0, scale=self.random_crop_pad_std))
-
-            if min_x - (rand_tl + rand_bl) < 0:
-                rand_tl = rand_bl = 0
-            if min_y - (rand_br + rand_bl) * ratio < 0:
-                rand_br = rand_bl = 0
-            if max_x + (rand_tr + rand_br) > 1:
-                rand_tr = rand_br = 0
-            if max_y + (rand_tl + rand_tr) * ratio > 1:
-                rand_tl = rand_tr = 0
-
-            bpy.context.scene.render.border_min_x = min_x - (rand_tl + rand_bl)
-            bpy.context.scene.render.border_min_y = min_y - (rand_br + rand_bl) * ratio
-            bpy.context.scene.render.border_max_x = max_x + (rand_tr + rand_br)
-            bpy.context.scene.render.border_max_y = max_y + (rand_tl + rand_tr) * ratio
+            self.apply_crop(part)
 
 
 def clear_parts():
     bpy.ops.object.select_all(action='DESELECT')
     for i in bpy.data.objects.keys():
         if '.dat' in i:
+            bpy.context.view_layer.objects.active = bpy.data.objects[i]
             bpy.data.objects[i].select_set(True)
             bpy.ops.object.delete()
 
@@ -257,20 +267,28 @@ def seconds_to_time(seconds):
     return "%02d:%02d:%.4g" % (int(hrs), int(min), seconds)
 
 
-def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_part, pics_per_iter, cam_settings, amount=999999, exclude_list=None,
-                     simulate_physics=True, conveyor=True, start_pos_z=0.0, start_pos_z_std=0.1, start_pos_y_std=0.0, start_pos_x_std=0.1,
-                     min_dist_to_cam=1.0, overwrite_existing=True, light_energy=18000):
+def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_part, pics_per_iter, cam_settings,
+                     amount=999999, exclude_list=None,
+                     simulate_physics=True, conveyor_speed=0.2, start_pos_z=0., start_pos_y_std=0., start_pos_x_std=0.1,
+                     min_dist_to_cam=1.0, overwrite_existing=True, light_energy=1000):
     t1 = time.time()
-    bpy.ops.wm.open_mainfile(filepath=room_path)
 
-    color_std = 0.002
-    light_pos_std = 0.2
-    light_col_std = 0.03
-    light_watt_std = 50
+    bpy.ops.object.select_all(action='SELECT')
+    bpy.ops.object.delete()
+
+    bpy.ops.import_scene.fbx(filepath=room_path)
+    bpy.context.view_layer.update()
+
     max_sim_steps = 320
     max_retry_count = 8
+    drop_height_range = (-0.5, 0.5)
+    color_range = (-0.003, 0.003)
+    light_col_range = (-0.03, 0.)
+    light_pos_range = (-1, 1)
+    light_energy_range = (-25, 25)
 
     cam = bpy.data.objects["Camera"]
+    bpy.context.scene.camera = cam
     plane = bpy.data.objects["Plane"]
     lights = [bpy.data.objects[i] for i in bpy.data.objects.keys() if 'Light' in i]
     light_def_vals = {}
@@ -285,13 +303,18 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
     rot_x = cam.rotation_euler[0]
     direction = mathutils.Vector((0, math.sin(rot_x), -math.cos(rot_x)))
 
-    hit, loc, norm, idx, ob, M = bpy.context.scene.ray_cast(bpy.context.evaluated_depsgraph_get(), cam.location, direction, distance=100000)
+    hit, loc, norm, idx, ob, M = bpy.context.scene.ray_cast(bpy.context.evaluated_depsgraph_get(), cam.location,
+                                                            direction, distance=100000)
 
     cam_mid = loc
 
     # render empty conveyor belt
+    clear_parts()
+    cam_settings.apply()
+    render_settings.apply()
+
     bpy.data.scenes[0].render.filepath = os.path.abspath(os.path.join(OUT_PATH, os.pardir)) + '\\empty.png'
-    bpy.ops.render.render(write_still=True)
+    # bpy.ops.render.render(write_still=True)
 
     header = None
     rendered_parts = []
@@ -347,8 +370,6 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
             start_pos = part.location.copy()
             start_rot = part.rotation_euler.copy()
 
-            skip_part = False
-
             for x in range(len(to_render)):
                 # reset scene
                 bpy.ops.object.select_all(action='DESELECT')
@@ -357,26 +378,37 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
                 part.location = start_pos
                 part.rotation_euler = start_rot
 
+                cam_settings.apply()
+
                 # randomize start rotation
                 rand_rotation(part, 'XYZ')
 
                 # pick a color
                 new_col = random.choice(colors)
-                new_col = [max(min(i / 255 + np.random.normal(color_std), 0.96), 0.04) for i in new_col]
+                new_col = [max(min(i / 255 + random.uniform(*color_range), 0.96), 0.04) for i in new_col]
                 new_col.append(1)
                 part.data.materials[0].node_tree.nodes["Group"].inputs[0].default_value = new_col
 
                 # randomize lighting
                 for light in lights:
-                    light.data.color[2] -= np.random.normal(loc=0, scale=light_col_std)
-                    light.data.energy += np.random.normal(loc=0, scale=light_watt_std)
-                    light.location[:2] = [light.location[i] + np.random.normal(loc=0, scale=light_pos_std) for i in range(2)]
+                    light.data.color[2] += random.uniform(*light_col_range)
+                    light.data.energy += random.uniform(*light_energy_range)
+                    light.location[:2] = [light.location[i] + random.uniform(*light_pos_range) for i in range(2)]
 
                 if simulate_physics:
+                    part.location[2] += random.uniform(*drop_height_range)
+
                     # set up physics rigidbodies
                     bpy.ops.object.select_all(action='DESELECT')
 
+                    plane.select_set(True)
+                    bpy.context.view_layer.objects.active = plane
+                    bpy.ops.rigidbody.objects_add(type='PASSIVE')
+                    plane.rigid_body.friction = 0.75
+                    plane.select_set(False)
+
                     part.select_set(True)
+                    bpy.context.view_layer.objects.active = part
                     bpy.ops.object.origin_set(type='ORIGIN_CENTER_OF_VOLUME', center='MEDIAN')
 
                     try:
@@ -411,37 +443,50 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
                 part.location[0] += np.random.normal(0, start_pos_x_std)
                 part.location[1] += np.random.normal(0, start_pos_y_std)
 
-                if conveyor and pics_per_iter == 1:
-                    part.location[1] = max_pos_y
+                valid_locations = []
 
-                for j in range(pics_per_iter):
-                    # apply settings
-                    render_settings.apply()
-                    cam_settings.apply()
-
-                    # check if the resulting image is square
-                    quot = render_settings.get_crop_quot()
-                    if not math.isclose(quot, 1.0, rel_tol=1e-3):
-                        count = 0
-                        while not math.isclose(quot, 1.0, rel_tol=1e-2) and count < max_retry_count:
-                            print(f'Adjusting piece position ({part.name})')
-                            v = (cam_mid - part.location) * 0.1
-                            v[2] = 0
-                            part.location += v
-                            render_settings.apply()
-                            quot = render_settings.get_crop_quot()
-                            count += 1
-
+                if conveyor_speed > 0:
+                    if pics_per_iter == 1:
+                        part.location[1] = max_pos_y
+                    else:
+                        # check if the image is square, reposition if not
+                        quot = render_settings.apply_crop(part)
                         if not math.isclose(quot, 1.0, rel_tol=1e-2):
-                            warn(f'--- BAD IMAGE DIMENSIONS, SKIPPING PART {part.name} ---')
-                            rendered_parts.remove(row)
-                            row.append('Reason: Bad image dimensions')
-                            unrenderable_parts.append(row)
-                            skip_part = True
-                            break
+                            count = 1
+                            while not math.isclose(quot, 1.0, rel_tol=1e-2) and count <= max_retry_count:
+                                print(f'Adjusting piece position {part.name}')
+                                part.location[0] = start_pos[0] + np.random.normal(0, start_pos_x_std / count)
+                                part.location[1] = start_pos[1] + np.random.normal(0, start_pos_y_std / count)
+                                quot = render_settings.apply_crop(part)
+                                count += 1
+
+                            if not math.isclose(quot, 1.0, rel_tol=1e-2):
+                                warn(f'--- BAD IMAGE DIMENSIONS, SKIPPING PART {part.name} ---')
+                                row.append('Reason: Bad image dimensions')
+                                rendered_parts.remove(row)
+                                unrenderable_parts.append(row)
+                                break
+
+                        while math.isclose(render_settings.apply_crop(part), 1.0, rel_tol=1e-2):
+                            valid_locations.append(part.location.copy())
+                            part.location[1] += conveyor_speed * np.sign(cam.location[1])
+
+                if pics_per_iter == 1:
+                    step = len(valid_locations)
+                else:
+                    step = (len(valid_locations) - 1) / (min(len(valid_locations), pics_per_iter) - 1)
+
+                j = 0.0
+                i = 0
+                while round(j) < len(valid_locations):
+                    # set part location
+                    part.location = valid_locations[round(j)]
+
+                    # apply settings
+                    render_settings.apply(part)
 
                     # render
-                    out_name = name + '_' + str(to_render[x]) + '_' + str(j)
+                    out_name = name + '_' + str(to_render[x]) + '_' + str(i)
                     bpy.data.scenes[0].render.filepath = OUT_PATH + out_name
                     bpy.ops.render.render(write_still=True)
 
@@ -451,15 +496,8 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
                     vec = tuple(round(i, 1) for i in vec)
                     row[-1][out_name] = vec
 
-                    if conveyor and pics_per_iter > 1:
-                        inc = (1.0 / (pics_per_iter - 1)) * max_pos_y
-                        if part.location[1] + inc <= max_pos_y:
-                            part.location[1] += inc
-                        else:
-                            part.location[1] = max_pos_y
-
-                if skip_part:
-                    break
+                    j += step
+                    i += 1
 
             part.data.materials[0].node_tree.nodes["Group"].inputs[0].default_value = def_col
             for light in lights:
@@ -471,7 +509,7 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
 
     i = 0
     header.append(f'Pos Vectors rel. to Cam {str(tuple(round(i, 2) for i in cam.location))}')
-    with open(OUT_CSV, 'w', newline='') as file:
+    with open(OUT_CSV, 'w') as file:
         writer = csv.writer(file, delimiter=',')
         writer.writerow(header)
         for row in rendered_parts:
@@ -489,13 +527,19 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
 
 
 if __name__ == '__main__':
-    exclude_list = ["75347.dat", "73485.dat", "2844.dat", "48288.dat", "4178523.dat", "2614.dat", "633.dat", "55167.dat", "4107073.dat"]
+    exclude_list = ["75347.dat", "73485.dat", "2844.dat", "48288.dat", "4178523.dat", "2614.dat", "633.dat",
+                    "55167.dat", "4107073.dat"]
 
-    colors = [(254, 205, 4), (245, 124, 31), (221, 26, 34), (233, 94, 162), (255, 245, 121), (246, 172, 205), (251, 171, 24),
-              (0, 108, 183), (0, 163, 218), (204, 224, 152), (0, 176, 78), (154, 201, 59), (106, 46, 20), (222, 139, 95),
-              (244, 244, 244), (230, 237, 206), (149, 117, 180), (72, 158, 207), (0, 190, 212), (192, 228, 218), (221, 196, 142),
-              (253, 195, 158), (188, 165, 207), (120, 191, 233), (112, 148, 122), (149, 126, 95), (160, 160, 158), (66, 67, 62), (75, 47, 147),
-              (103, 130, 151), (0, 146, 71), (129, 131, 82), (174, 116, 70), (165, 83, 33), (101, 103, 102), (195, 151, 56), (0, 57, 94),
+    colors = [(254, 205, 4), (245, 124, 31), (221, 26, 34), (233, 94, 162), (255, 245, 121), (246, 172, 205),
+              (251, 171, 24),
+              (0, 108, 183), (0, 163, 218), (204, 224, 152), (0, 176, 78), (154, 201, 59), (106, 46, 20),
+              (222, 139, 95),
+              (244, 244, 244), (230, 237, 206), (149, 117, 180), (72, 158, 207), (0, 190, 212), (192, 228, 218),
+              (221, 196, 142),
+              (253, 195, 158), (188, 165, 207), (120, 191, 233), (112, 148, 122), (149, 126, 95), (160, 160, 158),
+              (66, 67, 62), (75, 47, 147),
+              (103, 130, 151), (0, 146, 71), (129, 131, 82), (174, 116, 70), (165, 83, 33), (101, 103, 102),
+              (195, 151, 56), (0, 57, 94),
               (0, 75, 45), (58, 24, 14), (0, 0, 0), (135, 140, 143), (141, 5, 3), (4, 4, 4)]
 
     settings = RenderSettings(device='GPU',
@@ -514,26 +558,27 @@ if __name__ == '__main__':
 
     cam_settings = RaspiCamV1(pos_y=-10.5,
                               height=3.5,
-                              rot=55)
+                              height_range=0.2,
+                              rot=55,
+                              rot_range=0.3)
 
     generate_dataset(part_csv=ROOT + r'dataset\MostCommon.csv',
-                     room_path=ROOT + r'dataset\blender\ConveyorRoom.blend',
-                     amount=5,
+                     room_path=ROOT + r'dataset\blender\ConveyorRoom.fbx',
+                     amount=1,
                      exclude_list=[],
                      colors=colors,
                      render_settings=settings,
                      iters_per_part=1,
-                     pics_per_iter=2,
+                     pics_per_iter=5,
                      overwrite_existing=True,
 
-                     conveyor=True,
+                     conveyor_speed=0.2,
                      simulate_physics=True,
                      start_pos_z=3.5,
                      start_pos_x_std=0.5,
-                     start_pos_y_std=0.3,
-                     start_pos_z_std=0.1,
+                     start_pos_y_std=0.8,
 
-                     light_energy=18000,
+                     light_energy=1000,
                      cam_settings=cam_settings,
-                     min_dist_to_cam=3.2)
+                     min_dist_to_cam=math.tan(math.radians(cam_settings.rot)) * cam_settings.height + 0.5)
 
