@@ -10,7 +10,7 @@ import csv
 import copy
 from warnings import warn
 
-ROOT = r"C:\Users\sokfi\Code\jupyter\LegoClassification\\"
+ROOT = r"C:\Users\Paul\PycharmProjects\LegoClassification\\"
 LDRAW_PATH = ROOT + r"dataset\ldraw\\"
 OUT_PATH = ROOT + r"data\renders_2\\"
 OUT_CSV = ROOT + r"data\RenderedParts_2.csv"
@@ -266,6 +266,24 @@ def seconds_to_time(seconds):
     seconds -= min * 60
     return "%02d:%02d:%.4g" % (int(hrs), int(min), seconds)
 
+def calc_mass():
+
+    density = 0.095
+
+    for i in bpy.data.objects.keys():
+        if '.dat' in i:
+            bpy.context.view_layer.objects.active = bpy.data.objects[i]
+            bpy.data.objects[i].select_set(True)
+
+    polygons = bpy.context.active_object.data.polygons
+    vertices = bpy.context.active_object.data.vertices
+
+    volume = 0
+    for polygon in polygons:
+        volume += vertices[polygon.vertices[0]].co.dot(
+            vertices[polygon.vertices[1]].co.cross(vertices[polygon.vertices[2]].co)) / 6.0
+
+    return density * abs(volume)
 
 def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_part, pics_per_iter, cam_settings,
                      amount=999999, exclude_list=None,
@@ -370,6 +388,8 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
             start_pos = part.location.copy()
             start_rot = part.rotation_euler.copy()
 
+            part_mass = calc_mass()
+
             for x in range(len(to_render)):
                 # reset scene
                 bpy.ops.object.select_all(action='DESELECT')
@@ -420,7 +440,7 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
                         unrenderable_parts.append(row)
                         break
 
-                    part.rigid_body.mass = 0.002
+                    part.rigid_body.mass = part_mass
 
                     # step through the simulation until the part stops moving
                     prev_mat = None
