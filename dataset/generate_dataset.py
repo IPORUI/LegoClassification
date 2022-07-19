@@ -25,9 +25,7 @@ OUT_PATH = ROOT + r"data\renders_2\\"
 OUT_CSV = ROOT + r"data\RenderedParts_2.csv"
 
 
-# TODO: Crop around the actual part, not its bounding box
 # TODO: Sort the 1k most common parts by similarity, e.g part 92589 and 60621 should be the same class
-# TODO: The crop should always be a square, do not simply retry if it isn't
 
 
 class CamSettings:
@@ -73,6 +71,7 @@ class CamSettings:
 
 class RaspiCamV1(CamSettings):
     """Settings to emulate the Raspberry Camera V1"""
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs, horizontal_fov=53.5, sensor_height=2.74, sensor_width=3.76)
 
@@ -341,37 +340,47 @@ def calc_mass(part):
     return density * abs(volume)
 
 
-# Todo Split this into more subfunctions for readability
-def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_part, pics_per_iter, cam_settings,
-                     amount=999999, exclude_list=None,
-                     simulate_physics=True, conveyor_speed=0.2, start_pos_z=0., start_pos_y_std=0., start_pos_x_std=0.1,
-                     min_dist_to_cam=1.0, overwrite_existing=True, light_energy=1000, max_sim_steps=320, max_retry_count=8, drop_height_range=(-0.5, 0.5)):
+def run_physics_sim(part, colliders, max_sim_steps, part_mass=-1):
     """
-    Generate a dataset of rendered images
+    "Drop" the part from some height
 
-    :param drop_height_range: Part will be dropped from height +- range
-    :param max_retry_count: Maximum amount of attempts to render a part before it is skipped (a non-square image crop is a failed attempt)
+    :param part: Part to be dropped
+    :param colliders: Everything else the part isn't supposed to phase through (usually just the ground plane)
     :param max_sim_steps: Max amount of physics sim steps when dropping the part before locking it in place, in case the part hasn't stopped moving by then.
-    :param render_settings: A RenderSettings object containing Blender render settings
-    :param room_path: Path to the conveyor room path
-    :param part_csv: Path to the csv file of part file names
-    :param colors: A list of colors to chose from when rendering a part, should be common lego colors
-    :param iters_per_part: The amount of times each specific part is put through the conveyor (iters)
-    :param pics_per_iter: The amount of pictures to be taken each time a part passes through the conveyor room
-    :param cam_settings: A CamSettings object containing Blender camera settings
-    :param amount: Only render images of the first X parts from the part_csv file
-    :param exclude_list: Part names to be skipped
-    :param simulate_physics: Drop a part from some height and simulate physics each iteration for realistic positions
-    :param conveyor_speed:
-    :param start_pos_z: The height from which the part is to be dropped
-    :param start_pos_y_std: Standard deviation of a part's y coordinate from 0
-    :param start_pos_x_std: Standard deviation of a part's x coordinate from 0
-    :param min_dist_to_cam: Part positions will be interpolated between part y start position and cam.y - min_dist_to_cam
-    :param overwrite_existing: If an image with the same part name and iteration already exists, skip render
-    :param light_energy: Blender light energy of the conveyor room lights
+    :param part_mass:
     """
-    t1 = time.time()
+    # set up room physics rigidbodies so that the part doesn't fall through the ground
+    bpy.ops.object.select_all(action='DESELECT')
+    for col in colliders:
+        col.select_set(True)
+        bpy.context.view_layer.objects.active = col
+        bpy.ops.rigidbody.objects_add(type='PASSIVE')
+        col.rigid_body.friction = 0.75
+        col.select_set(False)
 
+    # set up part rigidbody
+    part.select_set(True)
+    bpy.context.view_layer.objects.active = part
+    bpy.ops.object.origin_set(type='ORIGIN_CENTER_OF_VOLUME', center='MEDIAN')
+    bpy.ops.rigidbody.objects_add(type='ACTIVE')
+
+    part.rigid_body.mass = part_mass if part_mass > 0 else calc_mass(part)
+
+    # step through the simulation until the part stops moving or max_sim_steps is reached
+    prev_mat = None
+    for step in range(max_sim_steps):
+        if prev_mat == part.matrix_world and step > 3:
+            break
+        prev_mat = part.matrix_world.copy()
+        bpy.context.scene.frame_set(step)
+
+    # lock the part and remove the rigidbody
+    bpy.ops.object.visual_transform_apply()
+    bpy.ops.rigidbody.object_remove()
+    part.select_set(False)
+
+
+def prepare_room(render_empty_room):
     # clear scene
     bpy.ops.object.select_all(action='SELECT')
     bpy.ops.object.delete()
@@ -380,18 +389,13 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
     bpy.ops.import_scene.fbx(filepath=room_path)
     bpy.context.view_layer.update()
 
-    color_range = (-0.003, 0.003)  # range to slightly randomize lego colors
-    light_col_range = (-0.03, 0.)  # slightly randomize light color
-    light_pos_range = (-1, 1)  # slightly randomize light positions
-    light_energy_range = (-25, 25)  # slightly randomize light energy
-
     # select all lights and add randomization
     cam = bpy.data.objects["Camera"]
     bpy.context.scene.camera = cam
     plane = bpy.data.objects["Plane"]
     lights = [bpy.data.objects[i] for i in bpy.data.objects.keys() if 'Light' in i]
     light_def_vals = {}
-
+    print(lights)
     for light in lights:
         light.data.energy = light_energy
         light_def_vals[light.name] = {}
@@ -399,17 +403,143 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
         light_def_vals[light.name]['energy'] = copy.deepcopy(light.data.energy)
         light_def_vals[light.name]['location'] = copy.deepcopy(light.location)
 
-    # rot_x = cam.rotation_euler[0]
-    # direction = mathutils.Vector((0, math.sin(rot_x), -math.cos(rot_x)))
-    # hit, loc, norm, idx, ob, M = bpy.context.scene.ray_cast(bpy.context.evaluated_depsgraph_get(), cam.location, direction, distance=100000)
-    # cam_mid = loc
-
     # render empty conveyor belt
     clear_parts()
     cam_settings.apply()
     render_settings.apply()
     bpy.data.scenes[0].render.filepath = os.path.abspath(os.path.join(OUT_PATH, os.pardir)) + '\\empty.png'
-    # bpy.ops.render.render(write_still=True)
+    bpy.ops.render.render(write_still=True)
+
+    return cam, plane, lights, light_def_vals
+
+
+def get_unfinished_iters(part_name, pics_per_iter, output_path=OUT_PATH):
+    """Return the indices of iterations with fewer pics than pics_per_iter"""
+    def iter_done(idx):
+        for j in range(pics_per_iter):
+            if not os.path.exists(output_path + part_name + '_' + str(idx) + '_' + str(j) + '.png'):
+                return False
+        return True
+
+    iters_to_render = [x for x in range(iters_per_part) if not iter_done(x)]
+    return iters_to_render
+
+
+def get_locations_with_square_crop():
+    """Return an array of all locations where cropping around the part would result in a square crop"""
+    # TODO: Garbage fucking code,
+    # Move the part on the conveyor belt and check if the image is square, retry if not
+    quot = render_settings.apply_crop(part)
+    if not math.isclose(quot, 1.0, rel_tol=1e-2):
+        # Repeatedly reposition until it's square.
+        for count in range(1, max_retry_count + 1):
+            print(f'Adjusting piece position {part.name}')
+            part.location[0] = start_pos[0] + np.random.normal(0, start_pos_x_std / count)
+            part.location[1] = start_pos[1] + np.random.normal(0, start_pos_y_std / count)
+            quot = render_settings.apply_crop(part)
+            count += 1
+            if math.isclose(quot, 1.0, rel_tol=1e-2):  # success
+                break
+
+        # If max_retry_count has been reached, skip the part entirely.
+        if count == max_retry_count:
+            warn(f'--- BAD IMAGE DIMENSIONS, SKIPPING PART {part.name} ---')
+            row.append('Reason: Bad image dimensions')
+            rendered_parts.remove(row)
+            unrenderable_parts.append(row)
+            return -1
+
+    valid_locations = []
+
+    # While the crop is square, move the part slightly forward and recheck if square. If yes, add pos to list of valid positions
+    while math.isclose(render_settings.apply_crop(part), 1.0, rel_tol=1e-2):
+        valid_locations.append(part.location.copy())
+        part.location[1] += conveyor_speed * np.sign(cam.location[1])
+
+    return valid_locations
+
+
+if __name__ == '__main__':
+    # region Settings
+
+    part_csv = ROOT + r'dataset\MostCommon.csv'  # Path to the csv file of part file names
+
+    room_path = ROOT + r'dataset\blender\ConveyorRoom.fbx'  # Path to the empty conveyor room file (.fbx)
+
+    exclude_list = []  # Part names to be skipped
+
+    amount = 1  # Only render images of the first X parts from the part_csv file
+
+    iters_per_part = 1  # The amount of times each specific part is put through the conveyor (iters)
+
+    pics_per_iter = 5  # The amount of pictures to be taken each time a part passes through the conveyor room
+
+    overwrite_existing = True  # If an image with the same part name and iteration already exists, skip render
+
+    conveyor_speed = 0.2  # currently unused (almost)
+
+    start_pos_z = 3.5  # The height from which the part is to be dropped
+
+    light_energy = 1000  # Blender light energy of the conveyor room lights
+
+    # physics
+    simulate_physics = True  # Drop a part from some height and simulate physics each iteration for realistic positions
+    max_sim_steps = 320  # Max amount of physics sim steps when dropping the part before locking it in place, in case the part hasn't stopped moving by then.
+    max_retry_count = 8  # Maximum amount of attempts to render a part before it is skipped (a non-square image crop is a failed attempt)
+
+    # randomization
+    drop_height_range = (-0.5, 0.5)  # Part will be dropped from height +- range
+    start_pos_x_std = 0.5  # Standard deviation of a part's x coordinate from 0
+    start_pos_y_std = 0.8  # Standard deviation of a part's y coordinate from 0
+    color_range = (-0.003, 0.003)  # range to slightly randomize lego colors
+    light_col_range = (-0.03, 0.)  # slightly randomize light color
+    light_pos_range = (-1, 1)  # slightly randomize light positions
+    light_energy_range = (-25, 25)  # slightly randomize light energy
+
+    # A list of colors to chose from when rendering a part, should be common lego colors
+    colors = [(254, 205, 4), (245, 124, 31), (221, 26, 34), (233, 94, 162), (255, 245, 121), (246, 172, 205),
+              (251, 171, 24),
+              (0, 108, 183), (0, 163, 218), (204, 224, 152), (0, 176, 78), (154, 201, 59), (106, 46, 20),
+              (222, 139, 95),
+              (244, 244, 244), (230, 237, 206), (149, 117, 180), (72, 158, 207), (0, 190, 212), (192, 228, 218),
+              (221, 196, 142),
+              (253, 195, 158), (188, 165, 207), (120, 191, 233), (112, 148, 122), (149, 126, 95), (160, 160, 158),
+              (66, 67, 62), (75, 47, 147),
+              (103, 130, 151), (0, 146, 71), (129, 131, 82), (174, 116, 70), (165, 83, 33), (101, 103, 102),
+              (195, 151, 56), (0, 57, 94),
+              (0, 75, 45), (58, 24, 14), (0, 0, 0), (135, 140, 143), (141, 5, 3), (4, 4, 4)]
+
+    # A RenderSettings object containing Blender render settings
+    render_settings = RenderSettings(device='GPU',
+                                     crop_mode='part',
+                                     random_crop_pad_std=0.002,
+                                     samples=64,
+                                     max_bounces=4,
+                                     diffuse_bounces=3,
+                                     glossy_bounces=3,
+                                     transmission_bounces=3,
+                                     transparent_max_bounces=3,
+                                     use_persistent_data=True,
+                                     resolution_x=1920,
+                                     resolution_y=1080,
+                                     tile_size=2048)
+
+    # A CamSettings object containing Blender camera settings
+    cam_settings = RaspiCamV1(pos_y=-10.5,
+                              height=3.5,
+                              height_range=0.2,
+                              rot=55,
+                              rot_range=0.3)
+
+    min_dist_to_cam = math.tan(math.radians(
+        cam_settings.rot)) * cam_settings.height + 0.5  # Part positions will be interpolated between part y start position and cam.y - min_dist_to_cam
+
+    # endregion  ##########################################################################################
+
+    t1 = time.time()
+
+    # Open room file, render it, and return commonly used objects
+    cam, plane, lights, light_default_vals = prepare_room(render_empty_room=False)
 
     header = None
     rendered_parts = []
@@ -419,45 +549,36 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
     with open(part_csv, 'r') as file:
         reader = csv.reader(file)
 
-        # for each part in parts_csv file
-        for i, row in enumerate(reader):
-            if i == 0:
-                header = row
+        for i, row in enumerate(reader):  # for each row in parts_csv file
+            if i == 0: header = row; continue
+            elif amount <= 0: break  # break if required amount of parts has been rendered
+
+            part_name = row[2]
+
+            # If overwrite_existing, render all images regardless if they already exist. Otherwise, get a list of unfinished ones only
+            if overwrite_existing:
+                iters_to_render = [x for x in range(iters_per_part)]
+            else:
+                iters_to_render = get_unfinished_iters(part_name=part_name, pics_per_iter=pics_per_iter, output_path=OUT_PATH)
+
+            # If empty, part is considered done and skipped
+            if not iters_to_render:
+                rendered_parts.append(row)
+                amount -= 1
                 continue
-            elif amount <= 0:  # break if required amount of parts has been rendered
-                break
-
-            to_render = [x for x in range(iters_per_part)]  # array holding the indeces of the iterations that still need to be rendered
-
-            name = row[2]
-            if not overwrite_existing:  # Skip existing images of parts if overwrite_existing is False
-
-                def iter_done(idx):
-                    for j in range(pics_per_iter):
-                        if not os.path.exists(OUT_PATH + name + '_' + str(idx) + '_' + str(j) + '.png'):
-                            return False
-                    return True
-
-                to_render = [x for x in range(iters_per_part) if not iter_done(x)]  # render all iters that have less than pics_per_iter images
-                if not to_render:
-                    rendered_parts.append(row)  # part is considered done and skipped if all iter indeces found in images
-                    continue
 
             clear_parts()
 
-            # Attempt to get the next ldraw part
-            try:
-                part = get_new_part(name=name + '.dat', exclude_list=exclude_list, delete_plate=True)
+            try:  # Attempt to get the next ldraw part
+                part = get_new_part(name=part_name + '.dat', exclude_list=exclude_list, delete_plate=True)
                 if part is None:
                     raise RuntimeError
-            except:
-                not_found_parts.append(name + '.dat')
-                print('--- CAN\'T FIND PART, SKIPPING: ' + name + '.dat ---')
+            except Exception as ex:
+                not_found_parts.append(part_name + '.dat')
+                print('--- CAN\'T FIND PART, SKIPPING: ' + part_name + '.dat ---')
                 continue
 
-            rendered_parts.append(row)
-
-            def_col = part.data.materials[0].node_tree.nodes["Group"].inputs[0].default_value[:]  # Save the part's default color
+            default_color = part.data.materials[0].node_tree.nodes["Group"].inputs[0].default_value[:]  # Save the part's default color
 
             bpy.context.scene.frame_end = max_sim_steps + pics_per_iter  # Set the amount of animation scenes to accomodate for the physics sim
 
@@ -470,7 +591,7 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
             start_rot = part.rotation_euler.copy()
 
             # For each iteration (the amount of times a part goes through the conveyor room, set by iters_per_part)
-            for x in range(len(to_render)):
+            for x in range(len(iters_to_render)):
                 # reset scene and part position
                 bpy.ops.object.select_all(action='DESELECT')
                 bpy.context.scene.frame_set(0)
@@ -495,25 +616,11 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
                     light.data.energy += random.uniform(*light_energy_range)
                     light.location[:2] = [light.location[i] + random.uniform(*light_pos_range) for i in range(2)]
 
+                # Simulate the part falling for realistic positions
                 if simulate_physics:
                     part.location[2] += random.uniform(*drop_height_range)
-
-                    # set up physics rigidbodies
-                    bpy.ops.object.select_all(action='DESELECT')
-
-                    # plane rigidbody
-                    plane.select_set(True)
-                    bpy.context.view_layer.objects.active = plane
-                    bpy.ops.rigidbody.objects_add(type='PASSIVE')
-                    plane.rigid_body.friction = 0.75
-                    plane.select_set(False)
-
-                    # part rigidbody
-                    part.select_set(True)
-                    bpy.context.view_layer.objects.active = part
-                    bpy.ops.object.origin_set(type='ORIGIN_CENTER_OF_VOLUME', center='MEDIAN')
                     try:
-                        bpy.ops.rigidbody.objects_add(type='ACTIVE')
+                        run_physics_sim(part, colliders=[plane], max_sim_steps=max_sim_steps, part_mass=part_mass)
                     except Exception as ex:  # Sometimes adding rigidbody doesn't work for whatever reason
                         warn(f'--- CAN\'T ADD RIGIDBODY, SKIPPING PART {part.name} ({str(ex)}) ---')
                         rendered_parts.remove(row)
@@ -521,72 +628,30 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
                         unrenderable_parts.append(row)
                         break
 
-                    part.rigid_body.mass = part_mass  # Set the part mass to the one calculated
-
-                    # step through the simulation until the part stops moving or max_sim_steps is reached
-                    prev_mat = None
-                    for step in range(max_sim_steps):
-                        if prev_mat == part.matrix_world and step > 3:
-                            break
-                        prev_mat = part.matrix_world.copy()
-                        bpy.context.scene.frame_set(step)
-
-                    # lock the part and remove the rigidbody
-                    bpy.ops.object.visual_transform_apply()
-                    bpy.ops.rigidbody.object_remove()
-                    part.select_set(False)
-
                 # reset part x and y pos
                 part.location[0] = start_pos[0]
                 part.location[1] = start_pos[1]
 
-                # randomize x and y pos
+                # slightly randomize x and y pos
                 part.location[0] += np.random.normal(0, start_pos_x_std)
                 part.location[1] += np.random.normal(0, start_pos_y_std)
 
-                valid_locations = []
-
-                # Move the part on the conveyor belt and generate pics_per_iter amount of images
-                if conveyor_speed > 0:
+                if conveyor_speed > 0:  # Get locations where the cropped image is square Todo: Add a mode where pics are rendered regardless
                     if pics_per_iter == 1:
                         part.location[1] = max_pos_y
-                    else:  # TODO: Garbage fucking code
-                        # check if the image is square, reposition if not
-                        quot = render_settings.apply_crop(part)
-                        if not math.isclose(quot, 1.0, rel_tol=1e-2):
-                            # Repeatedly reposition until it's square.
-                            for count in range(1, max_retry_count + 1):
-                                print(f'Adjusting piece position {part.name}')
-                                part.location[0] = start_pos[0] + np.random.normal(0, start_pos_x_std / count)
-                                part.location[1] = start_pos[1] + np.random.normal(0, start_pos_y_std / count)
-                                quot = render_settings.apply_crop(part)
-                                count += 1
-                                if math.isclose(quot, 1.0, rel_tol=1e-2):  # success
-                                    break
+                        valid_locations = [part.location.copy()]
+                    else:
+                        valid_locations = get_locations_with_square_crop()
 
-                            # If max_retry_count has been reached, skip the part entirely. Todo: This should never happen
-                            if count == max_retry_count:
-                                warn(f'--- BAD IMAGE DIMENSIONS, SKIPPING PART {part.name} ---')
-                                row.append('Reason: Bad image dimensions')
-                                rendered_parts.remove(row)
-                                unrenderable_parts.append(row)
-                                break
-
-                        # While the crop is square, move the part slightly forward and recheck if square. If yes, add pos to list of valid positions
-                        while math.isclose(render_settings.apply_crop(part), 1.0, rel_tol=1e-2):
-                            valid_locations.append(part.location.copy())
-                            part.location[1] += conveyor_speed * np.sign(cam.location[1])
-
-                # If there are 100 valid locations and pics_per_iter is 5, take 20 steps forward after each pic
+                # Calculate the step size. E.g. if there are 100 valid locations and pics_per_iter is 5, take 20 steps forward after each pic
                 # Step size can be a float to ensure the entire range of valid locations is covered.
                 if pics_per_iter == 1:
-                    step = len(valid_locations)
+                    step = 1
                 else:
                     step = (len(valid_locations) - 1) / (min(len(valid_locations), pics_per_iter) - 1)
 
-                j = 0.0
-                i = 0
-                # Step through valid part locations with float step size. The actual index is rounded to the nearest integer
+                # Step through valid part locations with step size and render
+                j, i = 0.0, 0
                 while round(j) < len(valid_locations):
                     # set part location
                     part.location = valid_locations[round(j)]
@@ -595,11 +660,11 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
                     render_settings.apply(part)
 
                     # render, output image file name is: partname_iternum_picnum.png
-                    out_name = name + '_' + str(to_render[x]) + '_' + str(i)
+                    out_name = part_name + '_' + str(iters_to_render[x]) + '_' + str(i)
                     bpy.data.scenes[0].render.filepath = OUT_PATH + out_name
                     bpy.ops.render.render(write_still=True)
 
-                    # manage logs
+                    # write logs
                     if not isinstance(row[-1], dict):
                         row.append({})
                     vec = part.location - cam.location
@@ -609,13 +674,14 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
                     j += step
                     i += 1
 
-            # reset to defaults
-            part.data.materials[0].node_tree.nodes["Group"].inputs[0].default_value = def_col
+            # reset colors and lights to defaults
+            part.data.materials[0].node_tree.nodes["Group"].inputs[0].default_value = default_color
             for light in lights:
-                light.data.color = light_def_vals[light.name]['color']
-                light.data.energy = light_def_vals[light.name]['energy']
-                light.location = light_def_vals[light.name]['location']
+                light.data.color = light_default_vals[light.name]['color']
+                light.data.energy = light_default_vals[light.name]['energy']
+                light.location = light_default_vals[light.name]['location']
 
+            rendered_parts.append(row)
             amount -= 1
 
     # Write logs
@@ -636,61 +702,3 @@ def generate_dataset(render_settings, room_path, part_csv, colors, iters_per_par
 
     if len(not_found_parts) > 0:
         print('The following parts could not be found:', *not_found_parts, sep='\n')
-
-
-if __name__ == '__main__':
-    exclude_list = ["75347.dat", "73485.dat", "2844.dat", "48288.dat", "4178523.dat", "2614.dat", "633.dat",
-                    "55167.dat", "4107073.dat"]
-
-    colors = [(254, 205, 4), (245, 124, 31), (221, 26, 34), (233, 94, 162), (255, 245, 121), (246, 172, 205),
-              (251, 171, 24),
-              (0, 108, 183), (0, 163, 218), (204, 224, 152), (0, 176, 78), (154, 201, 59), (106, 46, 20),
-              (222, 139, 95),
-              (244, 244, 244), (230, 237, 206), (149, 117, 180), (72, 158, 207), (0, 190, 212), (192, 228, 218),
-              (221, 196, 142),
-              (253, 195, 158), (188, 165, 207), (120, 191, 233), (112, 148, 122), (149, 126, 95), (160, 160, 158),
-              (66, 67, 62), (75, 47, 147),
-              (103, 130, 151), (0, 146, 71), (129, 131, 82), (174, 116, 70), (165, 83, 33), (101, 103, 102),
-              (195, 151, 56), (0, 57, 94),
-              (0, 75, 45), (58, 24, 14), (0, 0, 0), (135, 140, 143), (141, 5, 3), (4, 4, 4)]
-
-    settings = RenderSettings(device='GPU',
-                              crop_mode='part',
-                              random_crop_pad_std=0.002,
-                              samples=64,
-                              max_bounces=4,
-                              diffuse_bounces=3,
-                              glossy_bounces=3,
-                              transmission_bounces=3,
-                              transparent_max_bounces=3,
-                              use_persistent_data=True,
-                              resolution_x=1920,
-                              resolution_y=1080,
-                              tile_size=2048)
-
-    cam_settings = RaspiCamV1(pos_y=-10.5,
-                              height=3.5,
-                              height_range=0.2,
-                              rot=55,
-                              rot_range=0.3)
-
-    generate_dataset(part_csv=ROOT + r'dataset\MostCommon.csv',
-                     room_path=ROOT + r'dataset\blender\ConveyorRoom.fbx',
-                     amount=1,
-                     exclude_list=[],
-                     colors=colors,
-                     render_settings=settings,
-                     iters_per_part=1,
-                     pics_per_iter=5,
-                     overwrite_existing=True,
-
-                     conveyor_speed=0.2,
-                     simulate_physics=True,
-                     start_pos_z=3.5,
-                     start_pos_x_std=0.5,
-                     start_pos_y_std=0.8,
-
-                     light_energy=1000,
-                     cam_settings=cam_settings,
-                     min_dist_to_cam=math.tan(math.radians(cam_settings.rot)) * cam_settings.height + 0.5)
-
